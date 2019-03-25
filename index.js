@@ -2,6 +2,18 @@
 
 "use strict";
 /**
+ * 抢答器后端，具体使用见接口文档（/docs/API.md）
+ * 默认使用以下端口，当然你也可以手动指定
+ * - 3000:Websocket服务
+ * - 8090:HTTP服务
+ * - 8091:TCP服务
+ */
+
+const WS_PORT = 3000;
+const HTTP_PORT = 8090;
+const TCP_PORT = 8091;
+
+/**
  * 可以接受的抢答器延迟，毫秒
  */
 let ACC_GAP = 30;
@@ -177,6 +189,8 @@ function wsPush() {
         try {
             a.send(JSON.stringify({
                 stat,
+                ct: new Date().getTime(),
+                nt: stat === 1 ? nt : stat === 2 ? ne : 0,
                 reg: result.length,
                 res: result
             }));
@@ -299,7 +313,7 @@ server.on("error", function (err) {
 })
 
 //TCP监听
-server.listen(8091);
+server.listen(TCP_PORT);
 
 /**
  * WebSocket Server
@@ -309,7 +323,7 @@ server.listen(8091);
 const WebSocketServer = WebSocket.Server;
 // 实例化:
 const wss = new WebSocketServer({
-    port: 3000
+    port: WS_PORT
 });
 wss.on("listening", function () {
     console.log(`[WS] Server opend`);
@@ -352,11 +366,10 @@ wss.on("connection", function (ws, req) {
 //http服务器
 http.createServer(function (request, response) {
     response.setHeader('Access-Control-Allow-Origin', '*')
-    console.log(`[HTTP] Request from ${request.connection.remoteAddress}:${request.connection.remotePort}`)
+    console.log(`[HTTP] Request from ${request.connection.remoteAddress}:${request.connection.remotePort} at [${request.url}]`)
     //静态资源
-    if (request.url === "/www" ||
-        request.url === "/www/") {
-        let filePath = request.url;
+    if (/\/www.*/.test(request.url)) {
+        let filePath = request.url.substr(1);
         if (fs.lstatSync(filePath).isDirectory()) {
             if (/\/$/.test(filePath))
                 filePath += 'index.html';
@@ -502,8 +515,13 @@ http.createServer(function (request, response) {
                 clearTimeout(ni1);
                 clearTimeout(ni2);
                 stat = 4;
-                //计算nr
-                nr = new Date().getTime() - nt + t1;
+                //计算nr，用于恢复倒计时
+                nr = stat === 1 ?
+                    //1阶段未结束
+                    new Date().getTime() - nt + t1 :
+                    //1阶段结束，位于2阶段
+                    new Date().getTime() - ne + t2 + t1;
+
                 response.write("0");
                 wsPush();
                 wsPush_cof();
@@ -518,14 +536,24 @@ http.createServer(function (request, response) {
                     break;
                 }
                 if (nr < t1) {
-                    nt = new Date().getTime() + t1;
+                    //1阶段未结束
+                    stat = 1;
+                    //恢复nt，nt=当前时间+t1-nr
+                    nt = new Date().getTime() + t1 - nr;
+                    ne = nt + t2;
                     ni1 = setTimeout(function () {
+                        //结束1阶段
                         stat = 2;
                         wsPush();
                         console.log(`[ACT] stat = 2, catching`)
                     }, t1 - nr);
                 }
-                ne = new Date().getTime() + t1 + t2;
+                else {
+                    //1阶段结束，恢复到2阶段
+                    stat = 2;
+                }
+                //nt已经完了，计算ne，ne=当前时间+t1+t2-nr
+                ne = new Date().getTime() + t1 + t2 - nr;
                 ni2 = setTimeout(function () {
                     stat = 3;
                     wsPush();
@@ -576,5 +604,5 @@ http.createServer(function (request, response) {
         response.end();
     }
 
-}).listen(8090);
+}).listen(HTTP_PORT);
 console.log(`[HTTP] Server opened`);
