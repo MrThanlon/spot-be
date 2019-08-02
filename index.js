@@ -34,8 +34,8 @@ const url = require('url')
  * 结果记录，同时作为注册登记表，key=id，val=结果
  * val有如下值
  * - 0.未抢答
- * - xxx.正常，具体值为抢答用时，单位毫秒
- * - -1.犯规
+ * - <0.正常，具体值为抢答用时，单位毫秒
+ * - >0.犯规，提前抢答的毫秒数
  */
 let result = new Array();
 
@@ -70,17 +70,17 @@ let t2 = 10000;
 const CT_TIME = new Date().getTime();
 
 /**
- * 倒计时结束的时刻
+ * 倒计时阶段结束的时刻
  */
 let nt = CT_TIME;
 
 /**
- * 抢答结束时刻
+ * 抢答阶段结束时刻
  */
 let ne = CT_TIME;
 
 /**
- * 抢答已经进行的时间
+ * 已经进行的时间
  */
 let nr = 0;
 
@@ -154,19 +154,27 @@ function numToOct(num) {
  * @returns {String}
  */
 function numToHex(num) {
-    return num <= 0xff ?
-        num.toString(16) :
-        //numToString(num >> 8) + String.fromCharCode(num & 0xff);
-        numToHex(Math.floor(num / 100)) + " " + (num % 100).toString(16);
+    let ans = (num & 0xff).toString(16);
+    while (num >>= 8) {
+        ans = (num & 0xff).toString(16) + " " + ans;
+    }
+    return ans;
 }
 
 /**
- * 数字转Buffer
+ * 数字转Buffer，4字节
  * @param {Number} num
  * @returns {Buffer}
  */
 function numToBuff(num) {
-    return Buffer(numToOct(num).split(" "));
+    if (num === 0)
+        return Buffer.from([0]);
+    let arr = [];
+    while (num) {
+        arr.push(num & 0xff);
+        num >>= 8;
+    }
+    return Buffer.from(arr.reverse());
 }
 
 /**
@@ -181,18 +189,40 @@ function buffToNum(buff) {
 }
 
 /**
- * 推送结果到/msg
+ * Buffer转十六进制字符串
+ * @param {Buffer} buff
  */
-function wsPush() {
+function buffToHex(buff) {
+    let ans = "";
+    for (let i = 0; i < buff.length; i++) {
+        ans += buff[i].toString(16) + " ";
+    }
+    return ans;
+}
+
+/**
+ * 推送结果到/msg
+ * @param {Number} user
+ */
+function wsPush(user = null) {
+    const cct = new Date().getTime();
     //迭代
     client_pool = client_pool.filter((a, idx) => {
         try {
             a.send(JSON.stringify({
                 stat,
-                ct: new Date().getTime(),
-                nt: stat === 1 ? nt : stat === 2 ? ne : 0,
+                ct: cct,
+                nr,
+                //使用nr判断之前的stat
+                nt: stat === 1 ? nt :
+                    stat === 2 ? ne :
+                        stat === 4 ?
+                            (nr < t1 ? (cct + t1 - nr) : (cct + t1 + t2 - nr)) :
+                            0,
                 reg: result.length,
-                res: result
+                res: result,
+                //抢答的用户
+                user
             }));
             return true;
         }
@@ -232,32 +262,56 @@ server.on("connection", function (socket) {
     console.log(`[TCP] Connected from [${socket.remoteAddress}:${socket.remotePort}]`);
     //请求
     socket.on("data", function (data) {
+        //接收时钟
+        const CT_RECV = new Date().getTime();
         //data的类型为buffer
         const data_str = data.toString();
-        const data_hex = stringToHex(data_str);
+        const data_hex = buffToHex(data);
         //const data_num = parseInt("0x" + data_hex);
         console.log(`[TCP] Received from [${socket.remoteAddress}:${socket.remotePort}]:[${data_hex}]`);
         //socket.write(numToString(new Date().getTime() - CT_TIME));
         const flag = data_str.substr(0, 1).charCodeAt(0);
-        console.log(flag);
+        //console.log(flag);
         switch (flag) {
             case 0: {
-                //请求当前时钟
-                const ans = new Date().getTime() - CT_TIME;
-                socket.write(numToBuff(ans));
-                console.log(`[TCP] Request clock:[${numToHex(ans)}]`)
+                //请求当前时钟，响应长度为
+                const ans = CT_RECV - CT_TIME;
+                //计算ans长度，补0至4字节
+                let blen = 1;
+                while (ans >> (blen * 8))
+                    blen += 1;
+                if (blen > 4) {
+                    //当前时间过长，应重新启动
+                    console.log(`[TCP] Clock too long, exit`);
+                    process.exit();
+                }
+                socket.write(Buffer.concat([
+                    Buffer.from(Array(5 - blen).fill(0)),
+                    numToBuff(ans)
+                ]));
+                console.log(`[TCP] Request clock:[${numToHex(ans)}], using ${new Date().getTime() - CT_RECV}ms`)
                 break;
             }
             case 1: {
                 //请求注册
                 //用户数爆满
-                if (result.length >= 0xffffffff || stat !== 0)
+                if (result.length >= 0xffffffff || stat !== 0) {
+                    console.log(`[TCP] Reject registe`);
                     break;
+                }
                 //允许注册
                 result.push(0);
                 names.push(null);
                 const id = result.length - 1;
-                socket.write(numToBuff(id));
+                //补0计算
+                let blen = 1;
+                while (id >> (blen * 8))
+                    blen += 1;
+                socket.write(Buffer.concat([
+                    Buffer.from([1]),
+                    Buffer.from(Array(4 - blen).fill(0)),
+                    numToBuff(id)
+                ]));
                 console.log(`[TCP] Request registe:[${id}]`);
                 //推送
                 wsPush();
@@ -274,25 +328,26 @@ server.on("connection", function (socket) {
                 const id = buffToNum(data.slice(1, 5));
                 const time = buffToNum(data.slice(5, 9));
                 let time_valid = true;
-                if (stat == 0 || stat == 3 ||
+                if (stat === 0 || stat === 3 || stat === 4 ||
                     result[id] === undefined || result[id] !== 0) {
                     //没注册 || 不允许抢答
-                    socket.write(numToBuff(1));
+                    socket.write(Buffer.from([3, 1]));
                     return;
                 }
                 console.log(`[TCP] Answer from [${id}] at [${time}]`);
-                if (time < new Date().getTime() - CT_TIME - ACC_GAP ||
-                    time > new Date().getTime() - CT_TIME + ACC_GAP) {
+                const t_gap = Math.abs(time - (CT_RECV - CT_TIME));
+                if (t_gap > ACC_GAP) {
                     //时间误差过大，此时依然有效，但会以主机时钟为标尺
-                    socket.write(numToBuff(2));
+                    socket.write(Buffer.from([3, 2]));
                     time_valid = false;
+                    console.log(`[TCP] T_GAP too large for ${t_gap}`);
                 } else
-                    socket.write(numToBuff(0));
+                    socket.write(Buffer.from([3, 0]));
 
                 result[id] = time_valid ?
                     time + CT_TIME - nt ://客户端时钟
-                    new Date().getTime() - nt;//主机时钟
-                wsPush();
+                    CT_RECV - nt;//主机时钟
+                wsPush(id);
                 break;
             }
             default: {
@@ -367,14 +422,31 @@ wss.on("connection", function (ws, req) {
 http.createServer(function (request, response) {
     response.setHeader('Access-Control-Allow-Origin', '*')
     console.log(`[HTTP] Request from ${request.connection.remoteAddress}:${request.connection.remotePort} at [${request.url}]`)
-    //静态资源
+    //静态资源，匹配/www
     if (/\/www.*/.test(request.url)) {
         let filePath = request.url.substr(1);
+        //检测目录是否存在
+        if (!fs.existsSync(filePath)) {
+            //响应404
+            response.writeHead(404);
+            response.end('File not found');
+            response.end();
+            return;
+        }
+        //对于目录，添加index.html文件
         if (fs.lstatSync(filePath).isDirectory()) {
             if (/\/$/.test(filePath))
                 filePath += 'index.html';
             else
                 filePath += '/index.html';
+        }
+        //检测文件是否存在
+        if (!fs.existsSync(filePath)) {
+            //响应403，拒绝访问
+            response.writeHead(403);
+            response.end('File not found');
+            response.end();
+            return;
         }
 
         const extname = path.extname(filePath);
@@ -420,6 +492,7 @@ http.createServer(function (request, response) {
     }
     //控制接口
     else if (/^\/ctr\?/.test(request.url)) {
+        const cct = new Date().getTime();
         const parm = url.parse(request.url, true).query;
         //response.writeHead(200, {"Content-Type": "application/json"})
         switch (parm.act) {
@@ -436,7 +509,7 @@ http.createServer(function (request, response) {
                 //进入倒计时阶段
                 stat = 1;
                 //计算nt
-                nt = new Date().getTime() + t1;
+                nt = cct + t1;
                 //计算ne
                 ne = nt + t2;
                 //倒计时阶段
@@ -518,9 +591,9 @@ http.createServer(function (request, response) {
                 //计算nr，用于恢复倒计时
                 nr = stat === 1 ?
                     //1阶段未结束
-                    new Date().getTime() - nt + t1 :
+                    cct - nt + t1 :
                     //1阶段结束，位于2阶段
-                    new Date().getTime() - ne + t2 + t1;
+                    cct - ne + t2 + t1;
 
                 response.write("0");
                 wsPush();
@@ -539,7 +612,7 @@ http.createServer(function (request, response) {
                     //1阶段未结束
                     stat = 1;
                     //恢复nt，nt=当前时间+t1-nr
-                    nt = new Date().getTime() + t1 - nr;
+                    nt = cct + t1 - nr;
                     ne = nt + t2;
                     ni1 = setTimeout(function () {
                         //结束1阶段
@@ -553,7 +626,7 @@ http.createServer(function (request, response) {
                     stat = 2;
                 }
                 //nt已经完了，计算ne，ne=当前时间+t1+t2-nr
-                ne = new Date().getTime() + t1 + t2 - nr;
+                ne = cct + t1 + t2 - nr;
                 ni2 = setTimeout(function () {
                     stat = 3;
                     wsPush();
