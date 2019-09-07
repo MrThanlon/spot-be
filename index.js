@@ -206,6 +206,7 @@ function buffToHex(buff) {
  */
 function wsPush(user = null) {
     const cct = new Date().getTime();
+
     //迭代
     client_pool = client_pool.filter((a, idx) => {
         try {
@@ -538,6 +539,8 @@ http.createServer(function (request, response) {
                 //清除setTimeout任务
                 clearTimeout(ni1);
                 clearTimeout(ni2);
+                //成绩清除
+                result = result.map((a) => a = 0);
                 //回位
                 stat = 0;
                 //响应
